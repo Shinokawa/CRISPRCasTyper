@@ -11,54 +11,27 @@ class ProteinAnalyzer:
             input_file: 输入的FASTA文件路径
         """
         self.input_file = input_file
+        self.sequence_count = self._count_sequences()
+        logging.info(f"FASTA文件包含约 {self.sequence_count} 个序列")
+    
+    def _count_sequences(self):
+        """计算FASTA文件中的序列数量"""
+        count = 0
         try:
-            self.sequences = list(SeqIO.parse(input_file, "fasta"))
-            logging.info(f"从{input_file}加载了{len(self.sequences)}个序列")
+            with open(self.input_file) as f:
+                for line in f:
+                    if line.startswith('>'):
+                        count += 1
+            return count
         except Exception as e:
-            logging.error(f"无法解析FASTA文件: {e}")
-            self.sequences = []
-
-    def filter_sequences(self, min_length=50):
-        """根据最小长度过滤序列
+            logging.error(f"计算序列数量时出错: {e}")
+            return 0
+    
+    def filter_sequences(self, min_length=50, output_file=None):
+        """流式过滤序列并直接写入输出文件
         
         Args:
             min_length: 最小蛋白质长度
-            
-        Returns:
-            过滤后的序列列表
-        """
-        original_count = len(self.sequences)
-        self.sequences = [seq for seq in self.sequences if len(seq.seq) >= min_length]
-        filtered_count = original_count - len(self.sequences)
-        logging.info(f"过滤掉了{filtered_count}个短于{min_length}氨基酸的序列")
-        return self.sequences
-
-    def preprocess_sequences(self):
-        """预处理序列（例如，移除重复项，标准化）
-        
-        Returns:
-            预处理后的序列列表
-        """
-        # 在这里可以添加更多的预处理步骤
-        seen_ids = set()
-        unique_sequences = []
-        
-        for seq in self.sequences:
-            if seq.id not in seen_ids:
-                seen_ids.add(seq.id)
-                unique_sequences.append(seq)
-        
-        duplicates_count = len(self.sequences) - len(unique_sequences)
-        if duplicates_count > 0:
-            logging.info(f"移除了{duplicates_count}个重复序列")
-            self.sequences = unique_sequences
-            
-        return self.sequences
-
-    def write_filtered_sequences(self, output_file=None):
-        """将过滤后的序列写入文件
-        
-        Args:
             output_file: 输出文件路径，如果为None则创建临时文件
             
         Returns:
@@ -68,10 +41,64 @@ class ProteinAnalyzer:
             with tempfile.NamedTemporaryFile(suffix='.fasta', delete=False) as temp_file:
                 output_file = temp_file.name
                 
-        SeqIO.write(self.sequences, output_file, "fasta")
-        logging.info(f"将{len(self.sequences)}个序列写入{output_file}")
+        filtered_count = 0
+        total_count = 0
+        duplicate_ids = set()
+        
+        # 使用流处理方式读取和写入
+        with open(output_file, 'w') as out_f:
+            # 批量处理序列
+            batch_size = 1000  # 调整批次大小以平衡内存使用和性能
+            current_batch = []
+            
+            for record in SeqIO.parse(self.input_file, "fasta"):
+                total_count += 1
+                
+                # 长度过滤
+                if len(record.seq) < min_length:
+                    filtered_count += 1
+                    continue
+                    
+                # 重复ID过滤
+                if record.id in duplicate_ids:
+                    continue
+                duplicate_ids.add(record.id)
+                
+                # 添加到当前批次
+                current_batch.append(record)
+                
+                # 批次满了就写入文件并清空批次
+                if len(current_batch) >= batch_size:
+                    SeqIO.write(current_batch, out_f, "fasta")
+                    current_batch = []
+                    
+                # 定期清空重复ID集合以控制内存使用
+                if len(duplicate_ids) > 100000:  # 调整为适当的值
+                    duplicate_ids = set()
+            
+            # 写入最后一批
+            if current_batch:
+                SeqIO.write(current_batch, out_f, "fasta")
+        
+        logging.info(f"过滤掉了 {filtered_count} 个短于 {min_length} 氨基酸的序列，共处理 {total_count} 个序列")
+        logging.info(f"将过滤后的序列写入 {output_file}")
         return output_file
-
+    
+    def preprocess_and_write(self, output_file=None, min_length=50, batch_size=1000):
+        """流式预处理序列并写入文件
+        
+        统一所有处理步骤成一个流程，只读一次文件
+        
+        Args:
+            output_file: 输出文件路径，如果为None则创建临时文件
+            min_length: 最小蛋白质长度
+            batch_size: 批处理大小
+            
+        Returns:
+            包含预处理序列的文件路径
+        """
+        return self.filter_sequences(min_length, output_file)
+    
     def analyze(self):
         """对蛋白质序列进行分析
         
@@ -79,7 +106,6 @@ class ProteinAnalyzer:
             分析结果
         """
         self.filter_sequences()
-        self.preprocess_sequences()
         
         # 基本序列统计
         stats = {
@@ -95,3 +121,57 @@ class ProteinAnalyzer:
                     f"最长: {stats['max_length']}")
                     
         return stats
+
+    def split_fasta_file(self, chunk_size=1000000000):  # 约1GB每块
+        """将大型FASTA文件分割成多个小文件
+        
+        Args:
+            chunk_size: 每个文件的近似大小(字节)
+                
+        Returns:
+            分割后的文件路径列表
+        """
+        chunk_files = []
+        
+        try:
+            file_size = os.path.getsize(self.input_file)
+            if file_size <= chunk_size:
+                return [self.input_file]  # 文件小于分块大小，不需要分割
+                
+            logging.info(f"文件大小为 {file_size/(1024*1024*1024):.2f} GB，进行分块处理")
+            
+            chunk_index = 0
+            current_size = 0
+            records = []
+            
+            for record in SeqIO.parse(self.input_file, "fasta"):
+                # 估算记录大小（粗略近似）
+                record_size = len(str(record.seq)) + len(record.id) + 50
+                
+                # 如果当前块将超出最大大小，则写入文件
+                if current_size + record_size > chunk_size and records:
+                    chunk_file = f"{self.input_file}.chunk{chunk_index}.fasta"
+                    with open(chunk_file, 'w') as out_f:
+                        SeqIO.write(records, out_f, "fasta")
+                    chunk_files.append(chunk_file)
+                    records = []
+                    current_size = 0
+                    chunk_index += 1
+                    logging.info(f"写入分块文件 {chunk_file}")
+                
+                records.append(record)
+                current_size += record_size
+            
+            # 写入最后一个块
+            if records:
+                chunk_file = f"{self.input_file}.chunk{chunk_index}.fasta"
+                with open(chunk_file, 'w') as out_f:
+                    SeqIO.write(records, out_f, "fasta")
+                chunk_files.append(chunk_file)
+                logging.info(f"写入最后一个分块文件 {chunk_file}")
+            
+            return chunk_files
+            
+        except Exception as e:
+            logging.error(f"分块处理文件时出错: {e}")
+            return [self.input_file]  # 出错时返回原文件

@@ -79,6 +79,32 @@ class HMMERSearch:
         logging.info(f"HMMER搜索完成，找到 {len(results)} 个匹配")
         return results
     
+    def search_chunks(self, chunk_files):
+        """搜索多个FASTA文件块
+        
+        Args:
+            chunk_files: FASTA文件块路径列表
+        
+        Returns:
+            包含HMMER搜索结果的列表
+        """
+        all_results = []
+        
+        for i, chunk_file in enumerate(chunk_files):
+            logging.info(f"处理FASTA块 {i+1}/{len(chunk_files)}: {os.path.basename(chunk_file)}")
+            chunk_results = self.search(chunk_file)
+            all_results.extend(chunk_results)
+            
+            # 搜索完成后删除临时块文件（如果文件名包含.chunk）
+            if '.chunk' in chunk_file:
+                try:
+                    os.unlink(chunk_file)
+                    logging.debug(f"已删除临时块文件: {chunk_file}")
+                except Exception as e:
+                    logging.warning(f"删除临时块文件时出错: {e}")
+        
+        return all_results
+
     def run_hmmer(self, fasta_file, hmm_file):
         """运行HMMER搜索
         
@@ -96,28 +122,40 @@ class HMMERSearch:
             hmm_name = os.path.basename(hmm_file)
             
             if sys.platform == "win32":
-                # 获取绝对路径
+                # Windows平台使用Docker
                 abs_fasta = os.path.abspath(fasta_file)
                 abs_hmm = os.path.abspath(hmm_file)
                 abs_output = os.path.abspath(temp_output_path)
                 
-                # 获取包含文件的目录，用于挂载
                 fasta_dir = os.path.dirname(abs_fasta)
                 hmm_dir = os.path.dirname(abs_hmm)
                 output_dir = os.path.dirname(abs_output)
                 
-                # Docker命令
                 cmd = ['docker', 'run', '--rm',
                       f'-v', f'{fasta_dir}:/fasta',
                       f'-v', f'{hmm_dir}:/hmm',
                       f'-v', f'{output_dir}:/output',
                       'hmmer-image',
+                      'hmmsearch',
                       '--cpu', str(self.hmmer_cpu),
                       '--tblout', f'/output/{os.path.basename(temp_output_path)}',
+                      '--noali',  # 不输出比对结果以节省内存
+                      '-Z', '50000000',  # 调整数据库大小假设值
+                      '--F1', '0.02',  # MSV过滤器阈值
+                      '--F2', '0.001',  # Viterbi过滤器阈值
                       f'/hmm/{os.path.basename(hmm_file)}',
                       f'/fasta/{os.path.basename(fasta_file)}']
             else:
-                cmd = ['hmmsearch', '--cpu', str(self.hmmer_cpu), '--tblout', temp_output_path, hmm_file, fasta_file]
+                # Unix平台直接运行HMMER
+                cmd = ['hmmsearch', 
+                      '--cpu', str(self.hmmer_cpu), 
+                      '--tblout', temp_output_path,
+                      '--noali',  # 不输出比对结果以节省内存
+                      '-Z', '50000000',  # 调整数据库大小假设值
+                      '--F1', '0.02',  # MSV过滤器阈值
+                      '--F2', '0.001',  # Viterbi过滤器阈值
+                      hmm_file, 
+                      fasta_file]
             
             process = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
@@ -130,13 +168,13 @@ class HMMERSearch:
             
         except subprocess.CalledProcessError as e:
             logging.error(f"HMMER搜索失败: {e}")
-            logging.error(f"标准输出: {e.stdout.decode('utf-8')}")
-            logging.error(f"标准错误: {e.stderr.decode('utf-8')}")
+            logging.error(f"标准输出: {e.stdout.decode('utf-8') if hasattr(e, 'stdout') else ''}")
+            logging.error(f"标准错误: {e.stderr.decode('utf-8') if hasattr(e, 'stderr') else ''}")
             return []
         except Exception as e:
             logging.error(f"运行HMMER时出错: {e}")
             return []
-    
+
     def parse_results(self, hmmer_output, hmm_name):
         """解析HMMER输出
         

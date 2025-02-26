@@ -34,24 +34,57 @@ def main():
     parser.add_argument('--simplelog', help='Use simple log format', action='store_true')
     parser.add_argument('--min_length', help='Minimum protein length', type=int, default=50)
     parser.add_argument('--threads', help='并行处理使用的线程数', type=int, default=None)
+    parser.add_argument('--large_file', help='优化处理大型文件', action='store_true')
+    parser.add_argument('--chunk_size', help='分块大小(MB)', type=int, default=1000)
     args = parser.parse_args()
 
     # 设置日志
     setup_logging(args.log_lvl, args.simplelog)
     
     try:
-        logging.info(f"开始分析文件: {args.input}")
+        file_size_mb = os.path.getsize(args.input) / (1024 * 1024)
+        logging.info(f"开始分析文件: {args.input} (大小: {file_size_mb:.2f} MB)")
         logging.info(f"使用HMM模型目录: {args.hmm_dir}")
         
         # 步骤1: 分析蛋白质序列
         analyzer = ProteinAnalyzer(args.input)
-        analyzer.filter_sequences(min_length=args.min_length)
-        input_file = analyzer.write_filtered_sequences()
-        logging.info(f"处理后的序列已保存至: {input_file}")
         
-        # 步骤2: 使用HMMER搜索潜在的CRISPR-Cas蛋白
-        hmmer_search = HMMERSearch(args.hmm_dir, num_threads=args.threads)
-        potential_proteins = hmmer_search.search(input_file)
+        # 大文件处理模式
+        if args.large_file or file_size_mb > 1000:  # 超过1GB时自动使用大文件处理模式
+            logging.info("大文件处理模式已激活")
+            
+            # 分块处理
+            chunk_size_bytes = args.chunk_size * 1024 * 1024  # 转换为字节
+            chunk_files = analyzer.split_fasta_file(chunk_size=chunk_size_bytes)
+            
+            if len(chunk_files) > 1:
+                logging.info(f"文件已分成 {len(chunk_files)} 个块进行处理")
+                
+                # 逐块过滤序列
+                filtered_chunks = []
+                for i, chunk_file in enumerate(chunk_files):
+                    logging.info(f"过滤块 {i+1}/{len(chunk_files)}")
+                    chunk_analyzer = ProteinAnalyzer(chunk_file)
+                    filtered_chunk = chunk_analyzer.filter_sequences(min_length=args.min_length)
+                    filtered_chunks.append(filtered_chunk)
+                
+                # 步骤2: 使用HMMER搜索潜在的CRISPR-Cas蛋白
+                hmmer_search = HMMERSearch(args.hmm_dir, num_threads=args.threads)
+                potential_proteins = hmmer_search.search_chunks(filtered_chunks)
+            else:
+                # 文件未被分块，直接流式处理
+                logging.info("使用流式处理模式处理整个文件")
+                filtered_file = analyzer.filter_sequences(min_length=args.min_length)
+                
+                hmmer_search = HMMERSearch(args.hmm_dir, num_threads=args.threads)
+                potential_proteins = hmmer_search.search(filtered_file)
+        else:
+            # 小文件处理模式，使用常规方法
+            filtered_file = analyzer.filter_sequences(min_length=args.min_length)
+            
+            hmmer_search = HMMERSearch(args.hmm_dir, num_threads=args.threads)
+            potential_proteins = hmmer_search.search(filtered_file)
+            
         logging.info(f"HMMER搜索完成，找到 {len(potential_proteins)} 个潜在的Cas蛋白")
         
         # 步骤3: 对识别出的CRISPR-Cas蛋白进行分类
@@ -79,6 +112,9 @@ def main():
         
     except Exception as e:
         logging.error(f"运行时出错: {e}")
+        # 记录详细堆栈跟踪
+        import traceback
+        logging.error(traceback.format_exc())
         return 1
         
     return 0
