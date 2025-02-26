@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import logging
 import multiprocessing
+import sys  # 添加sys模块导入
 import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from Bio import SeqIO
@@ -93,10 +94,31 @@ class HMMERSearch:
                 temp_output_path = temp_output.name
                 
             hmm_name = os.path.basename(hmm_file)
-            logging.debug(f"运行HMMER: hmmsearch --cpu {self.hmmer_cpu} --tblout {temp_output_path} {hmm_file} {fasta_file}")
             
-            # 添加--cpu参数指定HMMER使用的CPU数量
-            cmd = ['hmmsearch', '--cpu', str(self.hmmer_cpu), '--tblout', temp_output_path, hmm_file, fasta_file]
+            if sys.platform == "win32":
+                # 获取绝对路径
+                abs_fasta = os.path.abspath(fasta_file)
+                abs_hmm = os.path.abspath(hmm_file)
+                abs_output = os.path.abspath(temp_output_path)
+                
+                # 获取包含文件的目录，用于挂载
+                fasta_dir = os.path.dirname(abs_fasta)
+                hmm_dir = os.path.dirname(abs_hmm)
+                output_dir = os.path.dirname(abs_output)
+                
+                # Docker命令
+                cmd = ['docker', 'run', '--rm',
+                      f'-v', f'{fasta_dir}:/fasta',
+                      f'-v', f'{hmm_dir}:/hmm',
+                      f'-v', f'{output_dir}:/output',
+                      'hmmer-image',
+                      '--cpu', str(self.hmmer_cpu),
+                      '--tblout', f'/output/{os.path.basename(temp_output_path)}',
+                      f'/hmm/{os.path.basename(hmm_file)}',
+                      f'/fasta/{os.path.basename(fasta_file)}']
+            else:
+                cmd = ['hmmsearch', '--cpu', str(self.hmmer_cpu), '--tblout', temp_output_path, hmm_file, fasta_file]
+            
             process = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
             if os.path.exists(temp_output_path):
