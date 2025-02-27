@@ -1,30 +1,65 @@
+from Bio import SeqIO
 import os
 import tempfile
-from Bio import SeqIO
 import logging
+import gzip
 
 class ProteinAnalyzer:
-    def __init__(self, input_file):
+    def __init__(self, input_file, estimate_count=True):
         """初始化蛋白质分析器
         
         Args:
             input_file: 输入的FASTA文件路径
+            estimate_count: 是否估计序列数量（对于大文件设为False可提高性能）
         """
         self.input_file = input_file
-        self.sequence_count = self._count_sequences()
-        logging.info(f"FASTA文件包含约 {self.sequence_count} 个序列")
+        self.file_size = os.path.getsize(input_file) if os.path.exists(input_file) else 0
+        
+        # 对于大文件，使用文件大小估算序列数量
+        if self.file_size > 1024 * 1024 * 1000:  # 超过1GB
+            # 假设每个序列平均200个氨基酸，每个字符1字节，再加上FASTA头部约50字节
+            estimated_seq_size = 250  # 字节
+            self.sequence_count = self.file_size // estimated_seq_size
+            logging.info(f"大型FASTA文件检测到 ({self.file_size/(1024*1024*1024):.2f} GB)，估计包含约 {self.sequence_count} 个序列")
+        elif estimate_count:
+            self.sequence_count = self._estimate_sequences()
+            logging.info(f"FASTA文件包含约 {self.sequence_count} 个序列")
+        else:
+            self.sequence_count = None
     
-    def _count_sequences(self):
-        """计算FASTA文件中的序列数量"""
-        count = 0
+    def _estimate_sequences(self):
+        """估计FASTA文件中的序列数量
+        
+        对于大文件，只采样前100MB来估计
+        """
         try:
-            with open(self.input_file) as f:
+            # 检查是否为压缩文件
+            is_gzip = self.input_file.endswith('.gz')
+            
+            count = 0
+            bytes_read = 0
+            max_sample = 100 * 1024 * 1024  # 100MB采样
+            
+            if is_gzip:
+                opener = gzip.open
+            else:
+                opener = open
+                
+            with opener(self.input_file, 'rt') as f:
                 for line in f:
+                    bytes_read += len(line)
                     if line.startswith('>'):
                         count += 1
+                    if bytes_read > max_sample:
+                        break
+            
+            # 如果只读了部分文件，根据比例估计总数
+            if bytes_read < self.file_size and bytes_read > 0:
+                count = int(count * (self.file_size / bytes_read))
+                
             return count
         except Exception as e:
-            logging.error(f"计算序列数量时出错: {e}")
+            logging.error(f"估计序列数量时出错: {e}")
             return 0
     
     def filter_sequences(self, min_length=50, output_file=None):
@@ -45,42 +80,67 @@ class ProteinAnalyzer:
         total_count = 0
         duplicate_ids = set()
         
-        # 使用流处理方式读取和写入
-        with open(output_file, 'w') as out_f:
-            # 批量处理序列
-            batch_size = 1000  # 调整批次大小以平衡内存使用和性能
-            current_batch = []
-            
-            for record in SeqIO.parse(self.input_file, "fasta"):
-                total_count += 1
-                
-                # 长度过滤
-                if len(record.seq) < min_length:
-                    filtered_count += 1
-                    continue
-                    
-                # 重复ID过滤
-                if record.id in duplicate_ids:
-                    continue
-                duplicate_ids.add(record.id)
-                
-                # 添加到当前批次
-                current_batch.append(record)
-                
-                # 批次满了就写入文件并清空批次
-                if len(current_batch) >= batch_size:
-                    SeqIO.write(current_batch, out_f, "fasta")
-                    current_batch = []
-                    
-                # 定期清空重复ID集合以控制内存使用
-                if len(duplicate_ids) > 100000:  # 调整为适当的值
-                    duplicate_ids = set()
-            
-            # 写入最后一批
-            if current_batch:
-                SeqIO.write(current_batch, out_f, "fasta")
+        # 检查是否为压缩文件
+        is_gzip = self.input_file.endswith('.gz')
         
-        logging.info(f"过滤掉了 {filtered_count} 个短于 {min_length} 氨基酸的序列，共处理 {total_count} 个序列")
+        # 使用流处理方式读取和写入
+        try:
+            # 使用适当的打开方式
+            if is_gzip:
+                input_handle = gzip.open(self.input_file, "rt")
+            else:
+                input_handle = open(self.input_file, "r")
+                
+            with input_handle, open(output_file, 'w') as out_f:
+                # 批量处理序列
+                batch_size = 5000  # 调整批次大小以平衡内存使用和性能
+                current_batch = []
+                current_batch_size = 0
+                
+                for record in SeqIO.parse(input_handle, "fasta"):
+                    total_count += 1
+                    
+                    # 每处理10000条序列输出一次进度
+                    if total_count % 10000 == 0:
+                        logging.info(f"已处理 {total_count} 个序列，过滤了 {filtered_count} 个序列")
+                    
+                    # 长度过滤
+                    if len(record.seq) < min_length:
+                        filtered_count += 1
+                        continue
+                        
+                    # 重复ID过滤（可选，对大型数据集可能需要禁用）
+                    if record.id in duplicate_ids:
+                        filtered_count += 1
+                        continue
+                    
+                    duplicate_ids.add(record.id)
+                    
+                    # 添加到当前批次
+                    current_batch.append(record)
+                    current_batch_size += 1
+                    
+                    # 批次满了就写入文件并清空批次
+                    if current_batch_size >= batch_size:
+                        SeqIO.write(current_batch, out_f, "fasta")
+                        current_batch = []
+                        current_batch_size = 0
+                        
+                    # 定期清空重复ID集合以控制内存使用
+                    if len(duplicate_ids) > 100000:
+                        duplicate_ids.clear()  # 完全清空以节省内存
+                
+                # 写入最后一批
+                if current_batch:
+                    SeqIO.write(current_batch, out_f, "fasta")
+            
+        except Exception as e:
+            logging.error(f"过滤序列时出错: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
+            raise
+        
+        logging.info(f"过滤完成: 总共处理 {total_count} 个序列，过滤掉 {filtered_count} 个序列")
         logging.info(f"将过滤后的序列写入 {output_file}")
         return output_file
     
@@ -134,39 +194,58 @@ class ProteinAnalyzer:
         chunk_files = []
         
         try:
-            file_size = os.path.getsize(self.input_file)
-            if file_size <= chunk_size:
-                return [self.input_file]  # 文件小于分块大小，不需要分割
+            # 如果文件小于分块大小，不做分块
+            if self.file_size <= chunk_size:
+                logging.info(f"文件大小 ({self.file_size/(1024*1024):.2f} MB) 小于分块大小，不需要分割")
+                return [self.input_file]
                 
-            logging.info(f"文件大小为 {file_size/(1024*1024*1024):.2f} GB，进行分块处理")
+            logging.info(f"文件大小为 {self.file_size/(1024*1024*1024):.2f} GB，进行分块处理")
+            
+            # 检查是否为压缩文件
+            is_gzip = self.input_file.endswith('.gz')
             
             chunk_index = 0
-            current_size = 0
-            records = []
+            current_chunk_size = 0
+            current_records = []
             
-            for record in SeqIO.parse(self.input_file, "fasta"):
-                # 估算记录大小（粗略近似）
-                record_size = len(str(record.seq)) + len(record.id) + 50
-                
-                # 如果当前块将超出最大大小，则写入文件
-                if current_size + record_size > chunk_size and records:
-                    chunk_file = f"{self.input_file}.chunk{chunk_index}.fasta"
-                    with open(chunk_file, 'w') as out_f:
-                        SeqIO.write(records, out_f, "fasta")
-                    chunk_files.append(chunk_file)
-                    records = []
-                    current_size = 0
-                    chunk_index += 1
-                    logging.info(f"写入分块文件 {chunk_file}")
-                
-                records.append(record)
-                current_size += record_size
+            # 使用适当的文件打开方式
+            if is_gzip:
+                input_handle = gzip.open(self.input_file, "rt")
+            else:
+                input_handle = open(self.input_file, "r")
             
-            # 写入最后一个块
-            if records:
+            with input_handle:
+                for record in SeqIO.parse(input_handle, "fasta"):
+                    # 估算记录大小（ID长度 + 序列长度 + 头部开销）
+                    record_size = len(record.id) + len(str(record.seq)) + 10
+                    
+                    # 如果添加这条记录会超出分块大小并且当前分块不为空，则写入文件
+                    if current_chunk_size + record_size > chunk_size and current_records:
+                        chunk_file = f"{self.input_file}.chunk{chunk_index}.fasta"
+                        with open(chunk_file, 'w') as out_f:
+                            SeqIO.write(current_records, out_f, "fasta")
+                        
+                        chunk_files.append(chunk_file)
+                        current_records = []
+                        current_chunk_size = 0
+                        chunk_index += 1
+                        logging.info(f"写入分块文件 {chunk_file}")
+                    
+                    # 添加记录到当前分块
+                    current_records.append(record)
+                    current_chunk_size += record_size
+                    
+                    # 每1000条序列清理一次内存
+                    if len(current_records) % 1000 == 0:
+                        import gc
+                        gc.collect()
+            
+            # 写入最后一个分块
+            if current_records:
                 chunk_file = f"{self.input_file}.chunk{chunk_index}.fasta"
                 with open(chunk_file, 'w') as out_f:
-                    SeqIO.write(records, out_f, "fasta")
+                    SeqIO.write(current_records, out_f, "fasta")
+                
                 chunk_files.append(chunk_file)
                 logging.info(f"写入最后一个分块文件 {chunk_file}")
             
@@ -174,4 +253,6 @@ class ProteinAnalyzer:
             
         except Exception as e:
             logging.error(f"分块处理文件时出错: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
             return [self.input_file]  # 出错时返回原文件

@@ -47,7 +47,11 @@ def main():
         logging.info(f"使用HMM模型目录: {args.hmm_dir}")
         
         # 步骤1: 分析蛋白质序列
-        analyzer = ProteinAnalyzer(args.input)
+        file_size_mb = os.path.getsize(args.input) / (1024 * 1024)
+
+        # 如果是大文件，不要估计序列数量
+        estimate_count = file_size_mb < 1000  # 小于1GB才估计序列数量
+        analyzer = ProteinAnalyzer(args.input, estimate_count=estimate_count)
         
         # 大文件处理模式
         if args.large_file or file_size_mb > 1000:  # 超过1GB时自动使用大文件处理模式
