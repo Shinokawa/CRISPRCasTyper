@@ -204,50 +204,63 @@ class ProteinAnalyzer:
             # 检查是否为压缩文件
             is_gzip = self.input_file.endswith('.gz')
             
+            # Windows平台特定优化: 直接按行读取，避免使用SeqIO解析全部记录
             chunk_index = 0
-            current_chunk_size = 0
-            current_records = []
+            current_size = 0
+            buffer_size = 10 * 1024 * 1024  # 10MB写入缓冲区
             
-            # 使用适当的文件打开方式
+            # 创建第一个输出文件
+            chunk_file = f"{self.input_file}.chunk{chunk_index}.fasta"
+            out_f = open(chunk_file, 'w', buffering=buffer_size)
+            chunk_files.append(chunk_file)
+            
+            # 打开输入文件
             if is_gzip:
                 input_handle = gzip.open(self.input_file, "rt")
             else:
                 input_handle = open(self.input_file, "r")
-            
-            with input_handle:
-                for record in SeqIO.parse(input_handle, "fasta"):
-                    # 估算记录大小（ID长度 + 序列长度 + 头部开销）
-                    record_size = len(record.id) + len(str(record.seq)) + 10
-                    
-                    # 如果添加这条记录会超出分块大小并且当前分块不为空，则写入文件
-                    if current_chunk_size + record_size > chunk_size and current_records:
-                        chunk_file = f"{self.input_file}.chunk{chunk_index}.fasta"
-                        with open(chunk_file, 'w') as out_f:
-                            SeqIO.write(current_records, out_f, "fasta")
-                        
-                        chunk_files.append(chunk_file)
-                        current_records = []
-                        current_chunk_size = 0
-                        chunk_index += 1
-                        logging.info(f"写入分块文件 {chunk_file}")
-                    
-                    # 添加记录到当前分块
-                    current_records.append(record)
-                    current_chunk_size += record_size
-                    
-                    # 每1000条序列清理一次内存
-                    if len(current_records) % 1000 == 0:
-                        import gc
-                        gc.collect()
-            
-            # 写入最后一个分块
-            if current_records:
-                chunk_file = f"{self.input_file}.chunk{chunk_index}.fasta"
-                with open(chunk_file, 'w') as out_f:
-                    SeqIO.write(current_records, out_f, "fasta")
                 
-                chunk_files.append(chunk_file)
-                logging.info(f"写入最后一个分块文件 {chunk_file}")
+            with input_handle:
+                sequence = ""
+                header = ""
+                for line in input_handle:
+                    line_size = len(line)
+                    
+                    if line.startswith('>'):
+                        # 处理之前的序列
+                        if header and sequence:
+                            seq_size = len(header) + len(sequence) + 2  # 加上换行符
+                            
+                            # 如果当前块已满，创建新块
+                            if current_size > 0 and current_size + seq_size > chunk_size:
+                                out_f.close()
+                                logging.info(f"写入分块文件 {chunk_file} 完成 ({current_size/(1024*1024):.2f} MB)")
+                                
+                                # 创建新文件
+                                chunk_index += 1
+                                chunk_file = f"{self.input_file}.chunk{chunk_index}.fasta"
+                                out_f = open(chunk_file, 'w', buffering=buffer_size)
+                                chunk_files.append(chunk_file)
+                                current_size = 0
+                            
+                            # 写入序列到当前文件
+                            out_f.write(f"{header}\n{sequence}\n")
+                            current_size += seq_size
+                        
+                        # 保存新的序列头
+                        header = line.strip()
+                        sequence = ""
+                    else:
+                        # 累积序列
+                        sequence += line.strip()
+                
+                # 处理最后一个序列
+                if header and sequence:
+                    out_f.write(f"{header}\n{sequence}\n")
+            
+            # 关闭最后一个文件
+            out_f.close()
+            logging.info(f"写入最后一个分块文件 {chunk_file} 完成")
             
             return chunk_files
             
@@ -255,4 +268,12 @@ class ProteinAnalyzer:
             logging.error(f"分块处理文件时出错: {e}")
             import traceback
             logging.error(traceback.format_exc())
+            
+            # 确保所有打开的文件都被关闭
+            try:
+                if 'out_f' in locals() and not out_f.closed:
+                    out_f.close()
+            except:
+                pass
+                
             return [self.input_file]  # 出错时返回原文件
